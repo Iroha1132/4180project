@@ -8,9 +8,6 @@
 #include <time.h>
 #include <pthread.h>
 
-//1155174982
-//ZHANG YIYAO
-
 #define BUFFER_SIZE 1024
 
 enum Mode
