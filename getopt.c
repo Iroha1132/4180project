@@ -8,7 +8,7 @@
 #include <time.h>
 #include <pthread.h>
 
-#define BUFFER_SIZE 1024
+#define BUFFER_SIZE 5000
 
 enum Mode
 {
@@ -142,11 +142,10 @@ void ParseArguments(struct Config *pConfig, int argc, char **argv)
 
 int SendLoop(struct Config *pConfig)
 {
-    struct timeval StartTime, SendFinishTime;
+    struct timeval StartTime, SendFinishTime, TimeForDelay;
     unsigned long SeqNum = 0;
     double SendDelay = 0;                 // in milliseconds
     pConfig->SendRate = pConfig->PktRate; // bytes/second
-    double TotalTimeElapse = 0;
 
     if (pConfig->PktRate != 0)
         SendDelay = (float)(pConfig->PktSize) * 1000 / pConfig->SendRate;
@@ -160,6 +159,8 @@ int SendLoop(struct Config *pConfig)
         pConfig->data = (char *)malloc(pConfig->PktSize);
         *((unsigned long *)pConfig->data) = SeqNum;
 
+        gettimeofday(&TimeForDelay , NULL);
+
         if (pConfig->eProto == TCP)
         {
             send(pConfig->socket, pConfig->data, strlen(pConfig->data), 0);
@@ -171,13 +172,16 @@ int SendLoop(struct Config *pConfig)
 
         ++SeqNum;
         gettimeofday(&SendFinishTime, NULL);
+
         double TimeElapse = (double)(SendFinishTime.tv_sec - StartTime.tv_sec) * 1000 +
                             (double)(SendFinishTime.tv_usec - StartTime.tv_usec) / 1000;
+        double TimeElapseForDelay = (double)(SendFinishTime.tv_sec - TimeForDelay.tv_sec) * 1000 +
+                            (double)(SendFinishTime.tv_usec - TimeForDelay.tv_usec) / 1000;
 
         double SendRate = SeqNum / TimeElapse;
 
-        if (TimeElapse < SendDelay)
-            usleep((int)((SendDelay - TimeElapse) * 1000));
+        if (TimeElapseForDelay < SendDelay)
+            usleep((int)((SendDelay - TimeElapseForDelay) * 1000));
 
         pConfig->eSendRate = SendRate;
         pConfig->eTimeElapse = TimeElapse;
@@ -217,7 +221,7 @@ int RecvLoop(struct Config *pConfig)
             recvfrom(pConfig->socket, buffer, BUFFER_SIZE - 1, 0, (struct sockaddr *)&pConfig->newaddr, &pConfig->newaddr_len);
         }*/
 
-        unsigned long PktSN = *((unsigned long *)pConfig->data);
+        unsigned long PktSN = *((unsigned long *) buffer);
 
         if (PktSN > SeqNum)
         {
@@ -234,8 +238,8 @@ int RecvLoop(struct Config *pConfig)
         pConfig->eTimeElapse = TimeElapse;
 
         int RecvSeqNum = SeqNum - PktLost;
-        double LossRate = PktLost / SeqNum;
-        double RecvRate = RecvSeqNum / TimeElapse;
+        double LossRate = (double)PktLost / (double)SeqNum;
+        double RecvRate = (double)RecvSeqNum / (double)TimeElapse;
 
         pConfig->eRecvRate = RecvRate;
         pConfig->eLossRate = LossRate;
@@ -262,7 +266,7 @@ void *displayThreadFunc(void *arg)
     while (1)
     {
         displayStatistics(pConfig);
-        usleep(pConfig->Stat);
+        usleep(pConfig->Stat * 1000);
     }
     return NULL;
 }
