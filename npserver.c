@@ -291,6 +291,8 @@ int main(int argc, char **argv)
     pConfig->data[pConfig->PktSize - 1] = '\0';
     pConfig->PktRate = 1000; // bytes/second
 
+    int count = 0;
+
     while (1)
     {
         struct Config *clientConfig;
@@ -373,7 +375,9 @@ int main(int argc, char **argv)
         memset(clientConfig->data, 'A', clientConfig->PktSize);
         clientConfig->data[clientConfig->PktSize - 1] = '\0';
 
-        clientConfig->connection_info = 0;
+
+        clientConfig->connection_info = count++;
+
 
         // Start sending data or receiving data
         int sockfd, new_sockfd;
