@@ -7,8 +7,13 @@
 #include <sys/time.h>
 #include <time.h>
 #include <pthread.h>
+#include <errno.h>
+#include <fcntl.h>
 
-#define BUFFER_SIZE 5000
+#define BUFFER_SIZE 1024 * 1024
+
+#define MAX_THREADS 10
+#define MAX_QUEUE_SIZE 10
 
 enum Mode
 {
@@ -52,6 +57,20 @@ struct Config
     double eSendRate;
     double eRecvRate;
 };
+
+typedef struct Task {
+    struct Config *clientConfig;
+} Task;
+
+Task taskQueue[MAX_QUEUE_SIZE];
+int taskCount = 0;
+pthread_mutex_t queueMutex;
+pthread_cond_t queueCond;
+
+pthread_t *threads;
+int poolSize;
+int activeThreads = 0;
+time_t lastUtilizationCheck = 0;
 
 const char *modeToString(enum Mode mode)
 {
@@ -137,6 +156,34 @@ int SendLoop(struct Config *pConfig)
     printf("Connected to %s port %d [%d, %d]", pConfig->lhost, pConfig->lport, current_connection, pConfig->connection_info++);
     printf(" %s, %s, %.2d Bps\n", modeToString(pConfig->eMode), protoToString(pConfig->eProto), pConfig->PktRate);
 
+    int testfd;
+
+    //create tcp testfd
+    if (pConfig->eProto == UDP)
+    {
+
+        if ((testfd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
+        {
+            perror("socket creation failed");
+            exit(EXIT_FAILURE);
+        }
+
+        struct sockaddr_in testaddr;
+        int testport = 10;
+        testport += pConfig->lport;
+
+        testaddr.sin_family = AF_INET;
+        testaddr.sin_port = htons(testport);
+        inet_pton(AF_INET, pConfig->lhost, &testaddr.sin_addr);
+
+        while (connect(testfd, (struct sockaddr *)&testaddr, sizeof(testaddr)) < 0)
+        {
+            perror("connection to the server failed: try again");
+            sleep(1);
+        }
+    }
+    //end
+
     while (1)
     {
         pConfig->data = (char *)malloc(pConfig->PktSize);
@@ -146,12 +193,20 @@ int SendLoop(struct Config *pConfig)
 
         if (pConfig->eProto == TCP)
         {
-            send(pConfig->tcp_socket, pConfig->data, pConfig->PktSize, 0);
+            if (send(pConfig->tcp_socket, pConfig->data, pConfig->PktSize, MSG_NOSIGNAL) <= 0)
+            {
+                break;
+            }
         }
 
         else if (pConfig->eProto == UDP)
         {
             sendto(pConfig->udp_socket, pConfig->data, pConfig->PktSize, 0, (struct sockaddr *)&client, sizeof(client));
+
+            if (send(testfd, pConfig->data, pConfig->PktSize, MSG_NOSIGNAL) <= 0)
+            {
+                break;
+            }
         }
 
         ++SeqNum;
@@ -181,6 +236,7 @@ int RecvLoop(struct Config *pConfig)
     unsigned long SeqNum = 0;
     int PktLost = 0;
     char buffer[BUFFER_SIZE];
+    char testbuffer[BUFFER_SIZE];
 
     struct sockaddr_in servaddr, client;
     memset(&servaddr, 0, sizeof(servaddr));
@@ -196,6 +252,51 @@ int RecvLoop(struct Config *pConfig)
     printf("Connected to %s port %d [%d, %d]", pConfig->rhost, pConfig->rport, current_connection, pConfig->connection_info++);
     printf(" %s, %s, %.2d Bps\n", modeToString(pConfig->eMode), protoToString(pConfig->eProto), pConfig->PktRate);
 
+    int testfd, new_testfd;
+
+    //udp test
+    if (pConfig->eProto == UDP)
+    {
+        struct sockaddr_in testaddr, testclient;
+        memset(&testaddr, 0, sizeof(testaddr));
+        memset(&testclient, 0, sizeof(testclient));
+        int testclient_len = sizeof(testclient);
+
+        if ((testfd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
+        {
+            perror("socket creation failed");
+
+            exit(EXIT_FAILURE);
+        }
+
+        int testport = 10;
+        testport += pConfig->rport;
+        //use port + 10
+
+        testaddr.sin_family = AF_INET;
+        testaddr.sin_port = htons(testport);
+        inet_pton(AF_INET, pConfig->rhost, &testaddr.sin_addr);
+        
+        if (bind(testfd, (struct sockaddr *)&testaddr, sizeof(testaddr)) < 0)
+        {
+            perror("bind failed");
+            close(testfd);
+            exit(EXIT_FAILURE);
+        }
+
+        listen(testfd, 5);
+
+        new_testfd = accept(testfd, (struct sockaddr *)&testclient, &testclient_len);
+
+        if (new_testfd < 0)
+        {
+            perror("accept failed");
+            close(testfd);
+            exit(EXIT_FAILURE);
+        }
+    }
+    //end
+
     while (1)
     {
 
@@ -205,11 +306,25 @@ int RecvLoop(struct Config *pConfig)
             if (n > 0)
             {
                 buffer[n] = '\0';
+            } else if (n == 0)
+            {
+                break;
             }
         }
 
         else if (pConfig->eProto == UDP)
         {
+            
+            int m = recv(new_testfd, testbuffer, BUFFER_SIZE - 1, 0);
+            if (m > 0)
+            {
+                testbuffer[m] = '\0';
+            } else if (m == 0)
+            {
+                break;
+            }
+            
+
             int n = recvfrom(pConfig->udp_socket, buffer, BUFFER_SIZE - 1, 0, (struct sockaddr *)&client, &client_len);
             if (n > 0)
             {
@@ -242,9 +357,93 @@ int RecvLoop(struct Config *pConfig)
         pConfig->eLossPacket = PktLost;
         pConfig->eSeqNum = RecvSeqNum;
     }
+
 }
 
-void *clientHandler(void *arg)
+
+void *workerThread(void *arg)
+{
+    struct Config *clientConfig = (struct Config *)arg;
+
+    while (1) {
+        pthread_mutex_lock(&queueMutex);
+        while (taskCount == 0) {
+            pthread_cond_wait(&queueCond, &queueMutex);
+        }
+        
+        Task task = taskQueue[--taskCount];
+        activeThreads++;
+        pthread_mutex_unlock(&queueMutex);
+
+        if (task.clientConfig->eMode == SEND) {
+            SendLoop(task.clientConfig);
+        } else {
+            RecvLoop(task.clientConfig);
+        }
+
+        close(task.clientConfig->tcp_socket);
+        close(task.clientConfig->udp_socket);
+        close(task.clientConfig->tcp_new_socket);
+        free(task.clientConfig->data);
+        free(task.clientConfig);
+
+        pthread_mutex_lock(&queueMutex);
+        activeThreads--;
+        pthread_mutex_unlock(&queueMutex);
+    }
+
+    return NULL;
+}
+
+void addTask(struct Config *clientConfig) {
+    pthread_mutex_lock(&queueMutex);
+    taskQueue[taskCount++] = (Task){clientConfig};
+    pthread_cond_signal(&queueCond);
+    pthread_mutex_unlock(&queueMutex);
+}
+
+void resizePool(int newSize) {
+    pthread_mutex_lock(&queueMutex);
+    threads = realloc(threads, newSize * sizeof(pthread_t));
+    for (int i = poolSize; i < newSize; i++) {
+        pthread_create(&threads[i], NULL, workerThread, NULL);
+    }
+    poolSize = newSize;
+    pthread_mutex_unlock(&queueMutex);
+}
+
+void checkUtilization()
+{
+    time_t now = time(NULL);
+    double utilization = (double)activeThreads / poolSize;
+    printf("ActiveThreads: %d\n", activeThreads); 
+
+    if (utilization == 1)
+    {
+        resizePool(poolSize * 2);
+        printf("ActiveThreads: %d\n", activeThreads);
+        printf("Pool size has been DOUBLE\n");
+    }
+
+    if (now - lastUtilizationCheck >= 60)
+    {
+        if (utilization < 0.5) {
+            resizePool(poolSize / 2);
+            printf("ActiveThreads: %d\n", activeThreads);
+            printf("Pool size has been HALF\n");
+        }
+        lastUtilizationCheck = now;
+    }
+}
+
+void *checkUtilizationThread(void *arg) {
+    while (1) {
+        checkUtilization();
+        sleep(10);
+    }
+}
+
+/*void *clientHandler(void *arg)
 {
     struct Config *clientConfig = (struct Config *)arg;
 
@@ -264,7 +463,7 @@ void *clientHandler(void *arg)
     free(clientConfig->data);
     free(clientConfig);
     return NULL;
-}
+}*/
 
 int main(int argc, char **argv)
 {
@@ -290,8 +489,21 @@ int main(int argc, char **argv)
     memset(pConfig->data, 'A', sizeof(char) * pConfig->PktSize);
     pConfig->data[pConfig->PktSize - 1] = '\0';
     pConfig->PktRate = 1000; // bytes/second
+    poolSize = 8;
 
     int count = 0;
+
+    pthread_mutex_init(&queueMutex, NULL);
+    pthread_cond_init(&queueCond, NULL);
+    threads = malloc(poolSize * sizeof(pthread_t));
+
+    for (int i = 0; i < poolSize; i++) {
+        pthread_create(&threads[i], NULL, workerThread, NULL);
+    }
+
+    lastUtilizationCheck = time(NULL);
+    pthread_t utilizationThread;
+    pthread_create(&utilizationThread, NULL, checkUtilizationThread, NULL);
 
     while (1)
     {
@@ -412,21 +624,14 @@ int main(int argc, char **argv)
 
             if (clientConfig->eProto == TCP)
             {
-                if (connect(clientConfig->tcp_socket, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0)
+                while (connect(clientConfig->tcp_socket, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0)
                 {
-                    perror("connection to the server failed");
-                    exit(EXIT_FAILURE);
+                    perror("connection to the server failed: try again");
+                    sleep(1);
                 }
             }
 
-            pthread_t thread_id;
-            if (pthread_create(&thread_id, NULL, clientHandler, (void *)clientConfig) != 0)
-            {
-                perror("Failed to create thread");
-                free(clientConfig);
-            }
-
-            pthread_detach(thread_id);
+            addTask(clientConfig);
 
         }
         else if (clientConfig->eMode == RECV)
@@ -460,7 +665,7 @@ int main(int argc, char **argv)
 
             if (clientConfig->eProto == UDP)
             {
-                if (bind(clientConfig->udp_socket, (struct sockaddr *)&client, sizeof(client)) < 0)
+                if (bind(clientConfig->udp_socket, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0)
                 {
                     perror("bind failed");
                     close(clientConfig->udp_socket);
@@ -468,16 +673,76 @@ int main(int argc, char **argv)
                 }
             }
 
-            pthread_t thread_id;
-            if (pthread_create(&thread_id, NULL, clientHandler, (void *)clientConfig) != 0)
-            {
-                perror("Failed to create thread");
-                free(clientConfig);
-            }
-
-            pthread_detach(thread_id);
+            addTask(clientConfig);
         }
+
+/*
+    //udp client exist using tcp recv
+    if (clientConfig->eProto == UDP)
+    {
+    clientConfig->eProto = TCP;
+    clientConfig->eMode = RECV;
+    //use port + 10
+    clientConfig->rport += 10;
+
+    int existfd, new_existfd;
+
+    if (clientConfig->eProto == TCP)
+    {
+        if ((existfd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
+        {
+            perror("socket creation failed");
+            exit(EXIT_FAILURE);
+        }
+
+        clientConfig->tcp_socket = existfd;
     }
+
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_port = htons(clientConfig->rport);
+    inet_pton(AF_INET, clientConfig->rhost, &servaddr.sin_addr);
+
+    if (clientConfig->eProto == TCP)
+    {
+        if (bind(clientConfig->tcp_socket, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0)
+        {
+            perror("bind failed");
+            close(clientConfig->tcp_socket);
+            exit(EXIT_FAILURE);
+        }
+
+        listen(clientConfig->tcp_socket, 5);
+        new_existfd = accept(clientConfig->tcp_socket, (struct sockaddr *)&client, &client_len);
+
+        if (new_existfd < 0)
+        {
+            perror("accept failed");
+            close(clientConfig->tcp_socket);
+            exit(EXIT_FAILURE);
+        }
+
+        clientConfig->tcp_new_socket = new_existfd;
+    }
+
+    pthread_t thread_id;
+    if (pthread_create(&thread_id, NULL, clientHandler, (void *)clientConfig) != 0)
+    {
+        perror("Failed to create thread");
+        free(clientConfig);
+    }
+
+    pthread_detach(thread_id);
+    //end
+    }
+*/
+    }
+
+    for (int i = 0; i < poolSize; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    free(threads);
+    pthread_mutex_destroy(&queueMutex);
+    pthread_cond_destroy(&queueCond);
 
     return 0;
 }
