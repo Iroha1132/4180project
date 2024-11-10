@@ -49,6 +49,8 @@ struct Config
     int eSeqNum;
     double eSendRate;
     double eRecvRate;
+
+    double eJitter;
 };
 
 void ParseArguments(struct Config *pConfig, int argc, char **argv)
@@ -174,6 +176,34 @@ int SendLoop(struct Config *pConfig)
 
     printf("Start sending data\n");
 
+    int testfd;
+
+    //create tcp testfd
+    if (pConfig->eProto == UDP)
+    {
+
+        if ((testfd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
+        {
+            perror("socket creation failed");
+            exit(EXIT_FAILURE);
+        }
+
+        struct sockaddr_in testaddr;
+        int testport = 10;
+        testport += pConfig->rport;
+
+        testaddr.sin_family = AF_INET;
+        testaddr.sin_port = htons(testport);
+        inet_pton(AF_INET, pConfig->rhost, &testaddr.sin_addr);
+
+        while (connect(testfd, (struct sockaddr *)&testaddr, sizeof(testaddr)) < 0)
+        {
+            perror("connection to the server failed: try again");
+            sleep(1);
+        }
+    }
+    //end
+
     while (1)
     {
         pConfig->data = (char *)malloc(pConfig->PktSize);
@@ -189,6 +219,11 @@ int SendLoop(struct Config *pConfig)
         else if (pConfig->eProto == UDP)
         {
             sendto(pConfig->udp_socket, pConfig->data, pConfig->PktSize, 0, (struct sockaddr *)&client, sizeof(client));
+
+            if (send(testfd, pConfig->data, pConfig->PktSize, MSG_NOSIGNAL) <= 0)
+            {
+                break;
+            }
         }
 
         ++SeqNum;
@@ -213,9 +248,16 @@ int RecvLoop(struct Config *pConfig)
 {
     struct timeval StartTime, RecvFinishTime;
 
+    struct timeval last_recv_time, recv_time;
+    double mean_recv_interval = 0.0;
+    double mean_jitter = 0.0;
+    int num_intervals = 0;
+
+
     unsigned long SeqNum = 0;
     int PktLost = 0;
     char buffer[BUFFER_SIZE];
+    char testbuffer[BUFFER_SIZE];
 
     struct sockaddr_in servaddr, client;
     memset(&servaddr, 0, sizeof(servaddr));
@@ -226,6 +268,52 @@ int RecvLoop(struct Config *pConfig)
     gettimeofday(&StartTime, NULL);
 
     printf("Receiving data\n");
+
+    int testfd, new_testfd;
+
+    //udp test
+    if (pConfig->eProto == UDP)
+    {
+        struct sockaddr_in testaddr, testclient;
+        memset(&testaddr, 0, sizeof(testaddr));
+        memset(&testclient, 0, sizeof(testclient));
+        int testclient_len = sizeof(testclient);
+
+        if ((testfd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
+        {
+            perror("socket creation failed");
+
+            exit(EXIT_FAILURE);
+        }
+
+        int testport = 10;
+        testport += pConfig->lport;
+        //use port + 10
+
+        testaddr.sin_family = AF_INET;
+        testaddr.sin_port = htons(testport);
+        inet_pton(AF_INET, pConfig->lhost, &testaddr.sin_addr);
+
+        if (bind(testfd, (struct sockaddr *)&testaddr, sizeof(testaddr)) < 0)
+        {
+            perror("bind failed");
+            close(testfd);
+            exit(EXIT_FAILURE);
+        }
+
+        listen(testfd, 5);
+
+        new_testfd = accept(testfd, (struct sockaddr *)&testclient, &testclient_len);
+
+        if (new_testfd < 0)
+        {
+            perror("accept failed");
+            close(testfd);
+            exit(EXIT_FAILURE);
+        }
+
+    }
+    //end
 
     while (1)
     {
@@ -241,6 +329,15 @@ int RecvLoop(struct Config *pConfig)
 
         else if (pConfig->eProto == UDP)
         {
+            int m = recv(new_testfd, testbuffer, BUFFER_SIZE - 1, 0);
+            if (m > 0)
+            {
+                testbuffer[m] = '\0';
+            } else if (m == 0)
+            {
+                break;
+            }
+
             int n = recvfrom(pConfig->udp_socket, buffer, BUFFER_SIZE - 1, 0, (struct sockaddr *)&client, &client_len);
             if (n > 0)
             {
@@ -259,8 +356,26 @@ int RecvLoop(struct Config *pConfig)
         ++SeqNum;
 
         gettimeofday(&RecvFinishTime, NULL);
+        gettimeofday(&recv_time, NULL);
+
         double TimeElapse = (double)(RecvFinishTime.tv_sec - StartTime.tv_sec) * 1000 +
                             (double)(RecvFinishTime.tv_usec - StartTime.tv_usec) / 1000;
+        
+        if (num_intervals > 0)
+        {
+            double recv_interval = (double)(recv_time.tv_sec - last_recv_time.tv_sec) * 1000 +
+                                   (double)(recv_time.tv_usec - last_recv_time.tv_usec) / 1000;
+
+            double jitter = recv_interval - mean_recv_interval;
+            if (jitter < 0) jitter = -jitter;
+            mean_jitter = (mean_jitter * num_intervals + jitter) / (num_intervals + 1);
+
+            mean_recv_interval = (mean_recv_interval * num_intervals + recv_interval) / (num_intervals + 1);
+        }
+
+        pConfig->eJitter = mean_jitter;
+        last_recv_time = recv_time;
+        num_intervals++;
 
         pConfig->eTimeElapse = TimeElapse;
 
@@ -283,7 +398,7 @@ void displayStatistics(struct Config *pConfig)
     }
     else if (pConfig->eMode == RECV)
     {
-        printf("Elapsed [%dms] Pkts [%d] Lost [%d, %f%%] Rate [%fMbps]\n", pConfig->eTimeElapse, pConfig->eSeqNum, pConfig->eLossPacket, pConfig->eLossRate, pConfig->eRecvRate);
+        printf("Elapsed [%dms] Pkts [%d] Lost [%d, %f%%] Rate [%fMbps] Jitter [%fms]\n", pConfig->eTimeElapse, pConfig->eSeqNum, pConfig->eLossPacket, pConfig->eLossRate, pConfig->eRecvRate, pConfig->eJitter);
     }
 }
 
@@ -329,6 +444,28 @@ int EncodeArguments(struct Config *pConfig, char *Buf, int iBufSize)
 
     return idx;
 }
+
+/*void *clientHandler(void *arg)
+{
+    struct Config *clientConfig = (struct Config *)arg;
+
+    if (clientConfig->eMode == SEND)
+    {
+        SendLoop(clientConfig);
+    }
+    else if (clientConfig->eMode == RECV)
+    {
+        RecvLoop(clientConfig);
+    }
+
+    close(clientConfig->tcp_socket);
+    close(clientConfig->udp_socket);
+    close(clientConfig->tcp_new_socket);
+
+    free(clientConfig->data);
+    free(clientConfig);
+    return NULL;
+}*/
 
 int main(int argc, char **argv)
 {
@@ -445,6 +582,14 @@ int main(int argc, char **argv)
             }
         }
 
+        /*pthread_t thread_id;
+        if (pthread_create(&thread_id, NULL, clientHandler, (void *)pConfig) != 0)
+        {
+            perror("Failed to create thread");
+            free(pConfig);
+        }
+
+        pthread_detach(thread_id);*/
         SendLoop(pConfig);
     }
 
@@ -493,12 +638,60 @@ int main(int argc, char **argv)
             }
         }
 
+        /*pthread_t thread_id;
+        if (pthread_create(&thread_id, NULL, clientHandler, (void *)pConfig) != 0)
+        {
+            perror("Failed to create thread");
+            free(pConfig);
+        }
+
+        pthread_detach(thread_id);*/
         RecvLoop(pConfig);
     }
+/*
+    //udp client exist using tcp send
+    pConfig->eProto = TCP;
+    pConfig->eMode = SEND;
+    //use port + 10
+    pConfig->rport += 10;
 
-    close(pConfig->tcp_socket);
-    close(pConfig->udp_socket);
-    close(pConfig->tcp_new_socket);
+    int existfd;
 
+    if (pConfig->eProto == TCP)
+    {
+        if ((existfd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
+        {
+            perror("socket creation failed");
+
+            exit(EXIT_FAILURE);
+        }
+
+        pConfig->tcp_socket = existfd;
+    }
+
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_port = htons(pConfig->rport);
+    inet_pton(AF_INET, pConfig->rhost, &servaddr.sin_addr);
+
+    if (pConfig->eProto == TCP)
+    {
+        if (connect(pConfig->tcp_socket, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0)
+        {
+            perror("connection to the server failed");
+
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    pthread_t thread_id;
+    if (pthread_create(&thread_id, NULL, clientHandler, (void *)pConfig) != 0)
+    {
+        perror("Failed to create thread");
+        free(pConfig);
+    }
+
+    pthread_detach(thread_id);
+    //end
+*/
     return 0;
 }
