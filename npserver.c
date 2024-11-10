@@ -443,28 +443,6 @@ void *checkUtilizationThread(void *arg) {
     }
 }
 
-/*void *clientHandler(void *arg)
-{
-    struct Config *clientConfig = (struct Config *)arg;
-
-    if (clientConfig->eMode == SEND)
-    {
-        SendLoop(clientConfig);
-    }
-    else if (clientConfig->eMode == RECV)
-    {
-        RecvLoop(clientConfig);
-    }
-
-    close(clientConfig->tcp_socket);
-    close(clientConfig->udp_socket);
-    close(clientConfig->tcp_new_socket);
-
-    free(clientConfig->data);
-    free(clientConfig);
-    return NULL;
-}*/
-
 int main(int argc, char **argv)
 {
     // default settings of Config
@@ -675,66 +653,6 @@ int main(int argc, char **argv)
 
             addTask(clientConfig);
         }
-
-/*
-    //udp client exist using tcp recv
-    if (clientConfig->eProto == UDP)
-    {
-    clientConfig->eProto = TCP;
-    clientConfig->eMode = RECV;
-    //use port + 10
-    clientConfig->rport += 10;
-
-    int existfd, new_existfd;
-
-    if (clientConfig->eProto == TCP)
-    {
-        if ((existfd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
-        {
-            perror("socket creation failed");
-            exit(EXIT_FAILURE);
-        }
-
-        clientConfig->tcp_socket = existfd;
-    }
-
-    servaddr.sin_family = AF_INET;
-    servaddr.sin_port = htons(clientConfig->rport);
-    inet_pton(AF_INET, clientConfig->rhost, &servaddr.sin_addr);
-
-    if (clientConfig->eProto == TCP)
-    {
-        if (bind(clientConfig->tcp_socket, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0)
-        {
-            perror("bind failed");
-            close(clientConfig->tcp_socket);
-            exit(EXIT_FAILURE);
-        }
-
-        listen(clientConfig->tcp_socket, 5);
-        new_existfd = accept(clientConfig->tcp_socket, (struct sockaddr *)&client, &client_len);
-
-        if (new_existfd < 0)
-        {
-            perror("accept failed");
-            close(clientConfig->tcp_socket);
-            exit(EXIT_FAILURE);
-        }
-
-        clientConfig->tcp_new_socket = new_existfd;
-    }
-
-    pthread_t thread_id;
-    if (pthread_create(&thread_id, NULL, clientHandler, (void *)clientConfig) != 0)
-    {
-        perror("Failed to create thread");
-        free(clientConfig);
-    }
-
-    pthread_detach(thread_id);
-    //end
-    }
-*/
     }
 
     for (int i = 0; i < poolSize; i++) {
