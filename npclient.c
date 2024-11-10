@@ -445,28 +445,6 @@ int EncodeArguments(struct Config *pConfig, char *Buf, int iBufSize)
     return idx;
 }
 
-/*void *clientHandler(void *arg)
-{
-    struct Config *clientConfig = (struct Config *)arg;
-
-    if (clientConfig->eMode == SEND)
-    {
-        SendLoop(clientConfig);
-    }
-    else if (clientConfig->eMode == RECV)
-    {
-        RecvLoop(clientConfig);
-    }
-
-    close(clientConfig->tcp_socket);
-    close(clientConfig->udp_socket);
-    close(clientConfig->tcp_new_socket);
-
-    free(clientConfig->data);
-    free(clientConfig);
-    return NULL;
-}*/
-
 int main(int argc, char **argv)
 {
     // default settings of Config
@@ -582,14 +560,6 @@ int main(int argc, char **argv)
             }
         }
 
-        /*pthread_t thread_id;
-        if (pthread_create(&thread_id, NULL, clientHandler, (void *)pConfig) != 0)
-        {
-            perror("Failed to create thread");
-            free(pConfig);
-        }
-
-        pthread_detach(thread_id);*/
         SendLoop(pConfig);
     }
 
@@ -638,60 +608,8 @@ int main(int argc, char **argv)
             }
         }
 
-        /*pthread_t thread_id;
-        if (pthread_create(&thread_id, NULL, clientHandler, (void *)pConfig) != 0)
-        {
-            perror("Failed to create thread");
-            free(pConfig);
-        }
-
-        pthread_detach(thread_id);*/
         RecvLoop(pConfig);
     }
-/*
-    //udp client exist using tcp send
-    pConfig->eProto = TCP;
-    pConfig->eMode = SEND;
-    //use port + 10
-    pConfig->rport += 10;
 
-    int existfd;
-
-    if (pConfig->eProto == TCP)
-    {
-        if ((existfd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
-        {
-            perror("socket creation failed");
-
-            exit(EXIT_FAILURE);
-        }
-
-        pConfig->tcp_socket = existfd;
-    }
-
-    servaddr.sin_family = AF_INET;
-    servaddr.sin_port = htons(pConfig->rport);
-    inet_pton(AF_INET, pConfig->rhost, &servaddr.sin_addr);
-
-    if (pConfig->eProto == TCP)
-    {
-        if (connect(pConfig->tcp_socket, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0)
-        {
-            perror("connection to the server failed");
-
-            exit(EXIT_FAILURE);
-        }
-    }
-
-    pthread_t thread_id;
-    if (pthread_create(&thread_id, NULL, clientHandler, (void *)pConfig) != 0)
-    {
-        perror("Failed to create thread");
-        free(pConfig);
-    }
-
-    pthread_detach(thread_id);
-    //end
-*/
     return 0;
 }
