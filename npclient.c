@@ -13,7 +13,8 @@
 enum Mode
 {
     SEND,
-    RECV
+    RECV,
+    HTTP
 };
 
 enum Proto
@@ -51,6 +52,9 @@ struct Config
     double eRecvRate;
 
     double eJitter;
+
+    char *urlstr;
+    char *filename;
 };
 
 void ParseArguments(struct Config *pConfig, int argc, char **argv)
@@ -62,6 +66,7 @@ void ParseArguments(struct Config *pConfig, int argc, char **argv)
         struct option long_options[] = {
             {"send", 0, (int *)&(pConfig->eMode), SEND},
             {"recv", 0, (int *)&(pConfig->eMode), RECV},
+            {"http", 0, (int *)&(pConfig->eMode), HTTP},
 
             {"proto", 1, 0, 0},
 
@@ -77,6 +82,9 @@ void ParseArguments(struct Config *pConfig, int argc, char **argv)
 
             {"sbufsize", 1, 0, 'i'},
             {"rbufsize", 1, 0, 'j'},
+
+            {"url", 1, 0, 'k'},
+            {"file", 1, 0, 'l'},
 
         };
 
@@ -147,6 +155,22 @@ void ParseArguments(struct Config *pConfig, int argc, char **argv)
             printf("option -rbufsize with value `%s'\n", optarg);
             pConfig->rbufsize = atoi(optarg);
             break;
+        case 'k':
+            printf("option -url with value `%s'\n", optarg);
+            if (strncmp(optarg, "http://", 7) == 0 || strncmp(optarg, "https://", 8) == 0)
+            {
+                pConfig->urlstr = strdup(optarg);
+            }
+            else
+            {
+                fprintf(stderr, "Unsupported URL protocol: %s\n", optarg);
+            }
+            break;
+        case 'l':
+            printf("option -file with value `%s'\n", optarg);
+            // 分配内存并复制文件名
+            pConfig->filename = strdup(optarg);
+            break;
 
         default:
             printf("unsupported option `%s'\n", argv[optind]);
@@ -178,7 +202,7 @@ int SendLoop(struct Config *pConfig)
 
     int testfd;
 
-    //create tcp testfd
+    // create tcp testfd
     if (pConfig->eProto == UDP)
     {
 
@@ -202,7 +226,7 @@ int SendLoop(struct Config *pConfig)
             sleep(1);
         }
     }
-    //end
+    // end
 
     while (1)
     {
@@ -253,7 +277,6 @@ int RecvLoop(struct Config *pConfig)
     double mean_jitter = 0.0;
     int num_intervals = 0;
 
-
     unsigned long SeqNum = 0;
     int PktLost = 0;
     char buffer[BUFFER_SIZE];
@@ -271,7 +294,7 @@ int RecvLoop(struct Config *pConfig)
 
     int testfd, new_testfd;
 
-    //udp test
+    // udp test
     if (pConfig->eProto == UDP)
     {
         struct sockaddr_in testaddr, testclient;
@@ -288,7 +311,7 @@ int RecvLoop(struct Config *pConfig)
 
         int testport = 10;
         testport += pConfig->lport;
-        //use port + 10
+        // use port + 10
 
         testaddr.sin_family = AF_INET;
         testaddr.sin_port = htons(testport);
@@ -311,9 +334,8 @@ int RecvLoop(struct Config *pConfig)
             close(testfd);
             exit(EXIT_FAILURE);
         }
-
     }
-    //end
+    // end
 
     while (1)
     {
@@ -333,7 +355,8 @@ int RecvLoop(struct Config *pConfig)
             if (m > 0)
             {
                 testbuffer[m] = '\0';
-            } else if (m == 0)
+            }
+            else if (m == 0)
             {
                 break;
             }
@@ -360,14 +383,15 @@ int RecvLoop(struct Config *pConfig)
 
         double TimeElapse = (double)(RecvFinishTime.tv_sec - StartTime.tv_sec) * 1000 +
                             (double)(RecvFinishTime.tv_usec - StartTime.tv_usec) / 1000;
-        
+
         if (num_intervals > 0)
         {
             double recv_interval = (double)(recv_time.tv_sec - last_recv_time.tv_sec) * 1000 +
                                    (double)(recv_time.tv_usec - last_recv_time.tv_usec) / 1000;
 
             double jitter = recv_interval - mean_recv_interval;
-            if (jitter < 0) jitter = -jitter;
+            if (jitter < 0)
+                jitter = -jitter;
             mean_jitter = (mean_jitter * num_intervals + jitter) / (num_intervals + 1);
 
             mean_recv_interval = (mean_recv_interval * num_intervals + recv_interval) / (num_intervals + 1);
@@ -445,6 +469,244 @@ int EncodeArguments(struct Config *pConfig, char *Buf, int iBufSize)
     return idx;
 }
 
+void handle_http_request(struct Config *pConfig)
+{
+    // Generate HTTP GET request
+    char request[BUFFER_SIZE];
+    snprintf(request, sizeof(request),
+             "GET %s HTTP/1.1\r\n"
+             "Host: %s\r\n"
+             "Connection: close\r\n"
+             "\r\n",
+             pConfig->urlstr, pConfig->rhost);
+
+    int request_fd;
+    struct sockaddr_in servaddr;
+
+    // Create socket
+    if ((request_fd = socket(AF_INET, (pConfig->eProto == UDP) ? SOCK_DGRAM : SOCK_STREAM, 0)) < 0)
+    {
+        perror("socket creation failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // Set up server address
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_port = htons(pConfig->rport);
+    inet_pton(AF_INET, pConfig->rhost, &servaddr.sin_addr);
+
+    if (pConfig->eProto == TCP)
+    {
+        // Connect to server (only for TCP)
+        while (connect(request_fd, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0)
+        {
+            perror("connection to the server failed: try again");
+            sleep(1);
+        }
+        // Send HTTP GET request
+        send(request_fd, request, strlen(request), 0);
+        printf("HTTP GET request sent: %s\n", request);
+    }
+
+    // Receive server response
+    char buffer[BUFFER_SIZE];
+    int bytes_received;
+    int headers_ended = 0; // Flag for end of headers
+    FILE *output_file = NULL;
+
+    // Check if output to file is needed
+    if (strcmp(pConfig->filename, "/dev/null") != 0)
+    {
+        output_file = fopen(pConfig->filename, "w");
+        if (!output_file)
+        {
+            perror("File opening failed");
+            close(request_fd);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    if (pConfig->eProto == TCP)
+    {
+        // Handle TCP response
+        int headers_ended = 0; // Flag to check if headers have ended
+        while ((bytes_received = recv(request_fd, buffer, sizeof(buffer) - 1, 0)) > 0)
+        {
+            buffer[bytes_received] = '\0'; // Null-terminate the buffer
+
+            // Process response
+            if (!headers_ended)
+            {
+                // Look for the end of the response headers
+                char *header_end = strstr(buffer, "\r\n\r\n");
+                if (header_end)
+                {
+                    // Output headers to stdout (optional)
+                    printf("%.*s", (int)(header_end - buffer + 4), buffer); // Include headers
+                    headers_ended = 1; // Headers ended
+
+                    // Handle remaining content
+                    if (header_end + 4 < buffer + bytes_received)
+                    {
+                        // Write remaining content to file
+                        if (output_file)
+                        {
+                            fwrite(header_end + 4, 1, buffer + bytes_received - (header_end + 4), output_file);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // Directly write to file or stdout
+                if (output_file)
+                {
+                    fwrite(buffer, 1, bytes_received, output_file);
+                }
+                else
+                {
+                    printf("%s", buffer); // Default to stdout
+                }
+            }
+        }
+
+        if (bytes_received < 0)
+        {
+            perror("recv failed");
+        }
+    }
+    else if (pConfig->eProto == UDP)
+    {
+        // Main loop, continuously send requests until file data is received
+        char buffer[BUFFER_SIZE];
+        int headers_ended = 0; // Flag to check if headers have ended
+        int file_received = 0; // Flag to indicate if file data has been received
+        socklen_t addr_len = sizeof(servaddr);
+
+        // Send initial request
+        ssize_t bytes_sent = sendto(request_fd, request, strlen(request), 0, (struct sockaddr *)&servaddr, sizeof(servaddr));
+        printf("HTTP GET request sent via UDP: %s\n", request);
+        printf("Bytes sent: %zd\n", bytes_sent);
+
+        while (!file_received)
+        {
+            // Use select to prepare for detection
+            fd_set read_fds; // File descriptor set
+            struct timeval timeout;
+
+            // Clear the set and add request_fd
+            FD_ZERO(&read_fds);
+            FD_SET(request_fd, &read_fds);
+
+            // Set timeout (e.g., 1 second)
+            timeout.tv_sec = 1;
+            timeout.tv_usec = 0;
+
+            // Use select to wait for data
+            int activity = select(request_fd + 1, &read_fds, NULL, NULL, &timeout);
+
+            if (activity < 0)
+            {
+                perror("select error");
+                break; // Handle error and exit loop
+            }
+            else if (activity == 0)
+            {
+                // Timeout, continue sending request
+                bytes_sent = sendto(request_fd, request, strlen(request), 0, (struct sockaddr *)&servaddr, sizeof(servaddr));
+                printf("HTTP GET request sent via UDP: %s\n", request);
+                printf("Bytes sent: %zd\n", bytes_sent);
+                continue; // Continue to the next iteration
+            }
+            else
+            {
+                // Data is readable
+                if (FD_ISSET(request_fd, &read_fds))
+                {
+                    ssize_t bytes_received = recvfrom(request_fd, buffer, sizeof(buffer) - 1, 0, (struct sockaddr *)&servaddr, &addr_len);
+                    if (bytes_received < 0)
+                    {
+                        perror("recvfrom failed");
+                        break; // Handle error and exit loop
+                    }
+                    else
+                    {
+                        buffer[bytes_received] = '\0'; // Null-terminate the buffer
+
+                        // Process response
+                        if (!headers_ended)
+                        {
+                            // Look for the end of the response headers
+                            char *header_end = strstr(buffer, "\r\n\r\n");
+                            if (header_end)
+                            {
+                                // Output headers (optional)
+                                printf("%.*s", (int)(header_end - buffer + 4), buffer); // Include headers
+                                headers_ended = 1; // Headers ended
+
+                                // Handle remaining content
+                                if (header_end + 4 < buffer + bytes_received)
+                                {
+                                    // Write remaining content to file, ignoring END_OF_FILE marker
+                                    if (output_file)
+                                    {
+                                        // Calculate the length of remaining content
+                                        size_t remaining_length = bytes_received - (header_end + 4 - buffer);
+
+                                        // Check if remaining content contains END_OF_FILE marker
+                                        char *end_of_file_marker = strstr(header_end + 4, "END_OF_FILE");
+                                        if (end_of_file_marker)
+                                        {
+                                            // Calculate the length to write, excluding END_OF_FILE marker
+                                            size_t bytes_to_write = end_of_file_marker - (header_end + 4);
+                                            fwrite(header_end + 4, 1, bytes_to_write, output_file);
+                                        }
+                                        else
+                                        {
+                                            // If no END_OF_FILE marker, write the remaining content directly
+                                            fwrite(header_end + 4, 1, remaining_length, output_file);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        else
+                        {
+                            // If headers have ended, write directly to file or stdout
+                            if (output_file)
+                            {
+                                // Check for END_OF_FILE marker
+                                if (strstr(buffer, "END_OF_FILE") == NULL)
+                                {
+                                    fwrite(buffer, 1, bytes_received, output_file);
+                                }
+                            }
+                            else
+                            {
+                                printf("%s", buffer); // Default to stdout
+                            }
+                        }
+                        // Check if END_OF_FILE marker has been received
+                        if (strstr(buffer, "END_OF_FILE") != NULL) // Assume file ends with "END_OF_FILE" marker
+                        {
+                            file_received = 1; // File data received
+                            printf("Client received complete file data from server.\n");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Close file if opened
+    if (output_file)
+    {
+        fclose(output_file);
+    }
+
+    close(request_fd);
+}
+
 int main(int argc, char **argv)
 {
     // default settings of Config
@@ -460,7 +722,7 @@ int main(int argc, char **argv)
     pConfig->Stat = 500;
     pConfig->PktSize = 1000;
     pConfig->PktNum = 0;
-    pConfig->eProto = UDP;
+    pConfig->eProto = TCP;
     pConfig->rhost = "127.0.0.1";
     pConfig->rport = 4180;
     pConfig->lhost = "0.0.0.0";
@@ -469,6 +731,7 @@ int main(int argc, char **argv)
     memset(pConfig->data, 'A', sizeof(char) * pConfig->PktSize);
     pConfig->data[pConfig->PktSize - 1] = '\0';
     pConfig->PktRate = 1000; // bytes/second
+    pConfig->filename = strdup("/dev/null");
 
     nConfig->rhost = "127.0.0.1";
     nConfig->rport = 4180;
@@ -609,6 +872,12 @@ int main(int argc, char **argv)
         }
 
         RecvLoop(pConfig);
+    }
+
+    else if (pConfig->eMode == HTTP)
+    {
+        // HTTP mode
+        handle_http_request(pConfig);
     }
 
     return 0;
