@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <curl/curl.h>
 
 #define BUFFER_SIZE 1024 * 1024
 
@@ -18,7 +19,8 @@
 enum Mode
 {
     SEND,
-    RECV
+    RECV,
+    HTTP
 };
 
 enum Proto
@@ -56,9 +58,12 @@ struct Config
     int eSeqNum;
     double eSendRate;
     double eRecvRate;
+
+    char *urlstr;
 };
 
-typedef struct Task {
+typedef struct Task
+{
     struct Config *clientConfig;
 } Task;
 
@@ -71,6 +76,9 @@ pthread_t *threads;
 int poolSize;
 int activeThreads = 0;
 time_t lastUtilizationCheck = 0;
+
+int TcpThreads = 0;
+int UdpThreads = 0;
 
 const char *modeToString(enum Mode mode)
 {
@@ -158,7 +166,7 @@ int SendLoop(struct Config *pConfig)
 
     int testfd;
 
-    //create tcp testfd
+    // create tcp testfd
     if (pConfig->eProto == UDP)
     {
 
@@ -182,7 +190,7 @@ int SendLoop(struct Config *pConfig)
             sleep(1);
         }
     }
-    //end
+    // end
 
     while (1)
     {
@@ -254,7 +262,7 @@ int RecvLoop(struct Config *pConfig)
 
     int testfd, new_testfd;
 
-    //udp test
+    // udp test
     if (pConfig->eProto == UDP)
     {
         struct sockaddr_in testaddr, testclient;
@@ -271,12 +279,12 @@ int RecvLoop(struct Config *pConfig)
 
         int testport = 10;
         testport += pConfig->rport;
-        //use port + 10
+        // use port + 10
 
         testaddr.sin_family = AF_INET;
         testaddr.sin_port = htons(testport);
         inet_pton(AF_INET, pConfig->rhost, &testaddr.sin_addr);
-        
+
         if (bind(testfd, (struct sockaddr *)&testaddr, sizeof(testaddr)) < 0)
         {
             perror("bind failed");
@@ -295,7 +303,7 @@ int RecvLoop(struct Config *pConfig)
             exit(EXIT_FAILURE);
         }
     }
-    //end
+    // end
 
     while (1)
     {
@@ -306,7 +314,8 @@ int RecvLoop(struct Config *pConfig)
             if (n > 0)
             {
                 buffer[n] = '\0';
-            } else if (n == 0)
+            }
+            else if (n == 0)
             {
                 break;
             }
@@ -314,16 +323,16 @@ int RecvLoop(struct Config *pConfig)
 
         else if (pConfig->eProto == UDP)
         {
-            
+
             int m = recv(new_testfd, testbuffer, BUFFER_SIZE - 1, 0);
             if (m > 0)
             {
                 testbuffer[m] = '\0';
-            } else if (m == 0)
+            }
+            else if (m == 0)
             {
                 break;
             }
-            
 
             int n = recvfrom(pConfig->udp_socket, buffer, BUFFER_SIZE - 1, 0, (struct sockaddr *)&client, &client_len);
             if (n > 0)
@@ -357,27 +366,193 @@ int RecvLoop(struct Config *pConfig)
         pConfig->eLossPacket = PktLost;
         pConfig->eSeqNum = RecvSeqNum;
     }
-
 }
 
+void handle_server(struct Config *pConfig)
+{
+    struct sockaddr_in servaddr, client;
+    memset(&servaddr, 0, sizeof(servaddr));
+    memset(&client, 0, sizeof(client));
+    int client_len = sizeof(client);
+
+    // Socket setup
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_port = htons(pConfig->rport);              // Use rport for listening
+    inet_pton(AF_INET, pConfig->rhost, &servaddr.sin_addr); // Use rhost for listening
+
+    int server_fd;
+    // Create socket based on the protocol
+    if ((server_fd = socket(AF_INET, (pConfig->eProto == UDP) ? SOCK_DGRAM : SOCK_STREAM, 0)) < 0)
+    {
+        perror("socket creation failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // Bind the socket
+    if (bind(server_fd, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0)
+    {
+        perror("bind failed");
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    if (pConfig->eProto == TCP)
+    {
+        // Listen for incoming TCP connections
+        listen(server_fd, 5);
+        printf("Server listening on %s:%d (TCP)\n", pConfig->rhost, pConfig->rport);
+
+        while (1)
+        {
+            int client_fd = accept(server_fd, (struct sockaddr *)&client, &client_len);
+            if (client_fd < 0)
+            {
+                perror("accept failed");
+                continue;
+            }
+
+            // Handle incoming requests
+            char buffer[BUFFER_SIZE];
+            int nread = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+            if (nread > 0)
+            {
+                buffer[nread] = '\0';
+                printf("Received request:\n%s\n", buffer);
+
+                if (strncmp(buffer, "GET ", 4) == 0)
+                {
+                    char *file_path = strtok(buffer + 4, " ");
+                    if (file_path)
+                    {
+                        char command[BUFFER_SIZE];
+                        snprintf(command, sizeof(command), "curl -s %s", file_path);
+                        FILE *file = popen(command, "r");
+
+                        const char *response_header = "HTTP/1.1 200 OK\r\n"
+                                                      "Content-Type: text/html\r\n"
+                                                      "Connection: close\r\n\r\n";
+                        send(client_fd, response_header, strlen(response_header), MSG_NOSIGNAL);
+
+                        if (file)
+                        {
+                            char file_buffer[BUFFER_SIZE];
+                            while (fgets(file_buffer, sizeof(file_buffer), file) != NULL)
+                            {
+                                send(client_fd, file_buffer, strlen(file_buffer), MSG_NOSIGNAL);
+                            }
+                            pclose(file);
+                        }
+                        else
+                        {
+                            const char *not_found_response = "HTTP/1.1 404 Not Found\r\n"
+                                                             "Content-Type: text/plain\r\n"
+                                                             "Connection: close\r\n\r\n"
+                                                             "404 Not Found";
+                            send(client_fd, not_found_response, strlen(not_found_response), MSG_NOSIGNAL);
+                        }
+                    }
+                }
+            }
+
+            close(client_fd);
+        }
+    }
+    else if (pConfig->eProto == UDP)
+    {
+        // Handle UDP requests (acting like a simple HTTP server)
+        printf("Server listening on %s:%d (UDP)\n", pConfig->rhost, pConfig->rport);
+
+        while (1)
+        {
+            char buffer[BUFFER_SIZE];
+            // Receive data from clients
+            int nread = recvfrom(server_fd, buffer, sizeof(buffer) - 1, 0, (struct sockaddr *)&client, &client_len);
+            if (nread > 0)
+            {
+                buffer[nread] = '\0'; // Null-terminate the buffer
+                printf("Received UDP request:\n%s\n", buffer);
+
+                // Check if it's a GET request
+                if (strncmp(buffer, "GET ", 4) == 0)
+                {
+                    char *file_path = strtok(buffer + 4, " ");
+                    if (file_path)
+                    {
+                        char command[BUFFER_SIZE];
+                        snprintf(command, sizeof(command), "curl -s %s", file_path);
+                        FILE *file = popen(command, "r");
+
+                        const char *response_header = "HTTP/1.1 200 OK\r\n"
+                                                      "Content-Type: text/html\r\n"
+                                                      "Connection: close\r\n\r\n";
+                        sendto(server_fd, response_header, strlen(response_header), 0, (struct sockaddr *)&client, client_len);
+
+                        if (file)
+                        {
+                            char file_buffer[BUFFER_SIZE];
+                            while (fgets(file_buffer, sizeof(file_buffer), file) != NULL)
+                            {
+                                sendto(server_fd, file_buffer, strlen(file_buffer), 0, (struct sockaddr *)&client, client_len);
+                            }
+
+                            // Send END_OF_FILE message
+                            const char *end_of_file_msg = "END_OF_FILE\n"; // Add newline for clarity
+                            sendto(server_fd, end_of_file_msg, strlen(end_of_file_msg), 0, (struct sockaddr *)&client, client_len);
+
+                            pclose(file);
+                        }
+                        else
+                        {
+                            const char *not_found_response = "HTTP/1.1 404 Not Found\r\n"
+                                                             "Content-Type: text/plain\r\n"
+                                                             "Connection: close\r\n\r\n"
+                                                             "404 Not Found";
+                            sendto(server_fd, not_found_response, strlen(not_found_response), 0, (struct sockaddr *)&client, client_len);
+                        }
+                    }
+                    break; // Break after handling the first GET request
+                }
+            }
+        }
+    }
+
+    close(server_fd);
+}
 
 void *workerThread(void *arg)
 {
     struct Config *clientConfig = (struct Config *)arg;
 
-    while (1) {
+    while (1)
+    {
         pthread_mutex_lock(&queueMutex);
-        while (taskCount == 0) {
+        while (taskCount == 0)
+        {
             pthread_cond_wait(&queueCond, &queueMutex);
         }
-        
+
         Task task = taskQueue[--taskCount];
         activeThreads++;
+        if (task.clientConfig->eProto == TCP)
+        {
+            TcpThreads++;
+        }
+        else
+        {
+            UdpThreads++;
+        }
         pthread_mutex_unlock(&queueMutex);
 
-        if (task.clientConfig->eMode == SEND) {
+        if (task.clientConfig->eMode == HTTP)
+        {
+            handle_server(task.clientConfig);
+        }
+        else if (task.clientConfig->eMode == SEND)
+        {
             SendLoop(task.clientConfig);
-        } else {
+        }
+        else
+        {
             RecvLoop(task.clientConfig);
         }
 
@@ -385,27 +560,39 @@ void *workerThread(void *arg)
         close(task.clientConfig->udp_socket);
         close(task.clientConfig->tcp_new_socket);
         free(task.clientConfig->data);
-        free(task.clientConfig);
 
         pthread_mutex_lock(&queueMutex);
         activeThreads--;
+        if (task.clientConfig->eProto == TCP)
+        {
+            TcpThreads--;
+        }
+        else
+        {
+            UdpThreads--;
+        }
         pthread_mutex_unlock(&queueMutex);
+
+        free(task.clientConfig);
     }
 
     return NULL;
 }
 
-void addTask(struct Config *clientConfig) {
+void addTask(struct Config *clientConfig)
+{
     pthread_mutex_lock(&queueMutex);
     taskQueue[taskCount++] = (Task){clientConfig};
     pthread_cond_signal(&queueCond);
     pthread_mutex_unlock(&queueMutex);
 }
 
-void resizePool(int newSize) {
+void resizePool(int newSize)
+{
     pthread_mutex_lock(&queueMutex);
     threads = realloc(threads, newSize * sizeof(pthread_t));
-    for (int i = poolSize; i < newSize; i++) {
+    for (int i = poolSize; i < newSize; i++)
+    {
         pthread_create(&threads[i], NULL, workerThread, NULL);
     }
     poolSize = newSize;
@@ -416,7 +603,7 @@ void checkUtilization()
 {
     time_t now = time(NULL);
     double utilization = (double)activeThreads / poolSize;
-    printf("ActiveThreads: %d\n", activeThreads); 
+    printf("ActiveThreads: %d\n", activeThreads);
 
     if (utilization == 1)
     {
@@ -427,7 +614,8 @@ void checkUtilization()
 
     if (now - lastUtilizationCheck >= 60)
     {
-        if (utilization < 0.5) {
+        if (utilization < 0.5)
+        {
             resizePool(poolSize / 2);
             printf("ActiveThreads: %d\n", activeThreads);
             printf("Pool size has been HALF\n");
@@ -436,8 +624,10 @@ void checkUtilization()
     }
 }
 
-void *checkUtilizationThread(void *arg) {
-    while (1) {
+void *checkUtilizationThread(void *arg)
+{
+    while (1)
+    {
         checkUtilization();
         sleep(10);
     }
@@ -475,7 +665,8 @@ int main(int argc, char **argv)
     pthread_cond_init(&queueCond, NULL);
     threads = malloc(poolSize * sizeof(pthread_t));
 
-    for (int i = 0; i < poolSize; i++) {
+    for (int i = 0; i < poolSize; i++)
+    {
         pthread_create(&threads[i], NULL, workerThread, NULL);
     }
 
@@ -549,7 +740,14 @@ int main(int argc, char **argv)
         close(infofd);
         close(new_infofd);
 
-        clientConfig->eMode = nConfig->eMode ^ 1;
+        if (nConfig->eMode == 0 || nConfig->eMode == 1)
+        {
+            clientConfig->eMode = nConfig->eMode ^ 1;
+        }
+        else
+        {
+            clientConfig->eMode = nConfig->eMode;
+        }
         clientConfig->eProto = nConfig->eProto;
         clientConfig->PktSize = nConfig->PktSize;
         clientConfig->lhost = strdup(nConfig->rhost);
@@ -565,9 +763,7 @@ int main(int argc, char **argv)
         memset(clientConfig->data, 'A', clientConfig->PktSize);
         clientConfig->data[clientConfig->PktSize - 1] = '\0';
 
-
         clientConfig->connection_info = count++;
-
 
         // Start sending data or receiving data
         int sockfd, new_sockfd;
@@ -610,7 +806,6 @@ int main(int argc, char **argv)
             }
 
             addTask(clientConfig);
-
         }
         else if (clientConfig->eMode == RECV)
         {
@@ -653,9 +848,15 @@ int main(int argc, char **argv)
 
             addTask(clientConfig);
         }
+
+        else if (clientConfig->eMode == HTTP)
+        {
+            addTask(clientConfig);
+        }
     }
 
-    for (int i = 0; i < poolSize; i++) {
+    for (int i = 0; i < poolSize; i++)
+    {
         pthread_join(threads[i], NULL);
     }
     free(threads);
